@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weibo-research-copilot"
+version = "0.1.0"
+description = "博研助手 · 面向社科研究的微博舆论研究工具"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.45",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "rich>=13.0",
+    "httpx>=0.27",
+    "jieba>=0.42.1",
+]
+
+[project.optional-dependencies]
+# AI 增强（重度清洗档）所需；不装也能用规则表清洗
+ai = [
+    "onnxruntime>=1.17",
+    "tokenizers>=0.15",
+    "numpy>=1.26",
+]
+dev = [
+    "pytest>=8.0",
+]
+# 报告导出（Word）。不装也能跑采集/清洗/分析，只是少了 .docx 那一份；
+# docx_export 内部延迟导入，缺库时只影响导出按钮。
+report = [
+    "python-docx>=1.1",
+]
+
+[project.scripts]
+wrc = "wrc.cli:main"
+wrc-gui = "wrc.gui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["wrc*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
