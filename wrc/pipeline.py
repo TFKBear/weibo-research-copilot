@@ -312,7 +312,7 @@ class ResearchPipeline:
         """采集选中帖子的评论。
 
         Args:
-            should_stop: 每篇帖子开始前询问一次；返回 True 则提前收尾
+            should_stop: 帖子之间及评论分页之间询问；返回 True 则保留数据并收尾
                 （已采到的数据照常保留并入库，不做"半途丢弃"）。
 
         Returns:
@@ -394,6 +394,8 @@ class ResearchPipeline:
 
         total_comments = 0
         skipped: list[dict[str, str]] = []
+        incomplete = False
+        halt_kinds = {"auth_required", "risk_blocked", "rate_limited", "budget", "network"}
         async with BrowserSession(
             self.settings, notify=lambda m: self._emit("info", m), log=log
         ) as session:
@@ -404,6 +406,7 @@ class ResearchPipeline:
 
             for index, post in enumerate(selected, start=1):
                 if should_stop is not None and should_stop():
+                    incomplete = True
                     self._emit("warn", "已按你的要求停止采集，已采到的数据会保留。")
                     log.record("stop_requested", at_post=post.mid)
                     break
@@ -413,7 +416,7 @@ class ResearchPipeline:
                     f"({index}/{len(selected)}) 采集 {post.mid}，目标 {target} 条 …",
                 )
                 # 单篇帖子的失败不该毁掉整轮采集。
-                # 实测踩过：某帖接口返回 ok=0「暂无数据」（帖子被删/评论不可见），
+                # 实测踩过：某帖接口返回 ok=0「暂无数据」，
                 # 旧代码直接抛出，于是前面辛苦采到的 100 条连清洗都没跑就废了。
                 # 现在的规则是：跳过这一篇、记进日志和研究日志、继续下一篇；
                 # 只有"一篇都没采到"才算本次采集失败。
@@ -428,12 +431,14 @@ class ResearchPipeline:
                         expected_total=post.comments_count,
                         since=window.since,
                         until=window.until,
+                        should_stop=should_stop,
                     )
                 except WrcError as exc:
                     skipped.append({"post_mid": post.mid, "reason": exc.what_happened})
                     self._emit(
                         "warn",
-                        f"  {post.mid} 跳过：{exc.what_happened}（继续下一篇）",
+                        f"  {post.mid} 跳过：{exc.what_happened}"
+                        + ("（停止本轮）" if exc.kind.value in halt_kinds else "（继续下一篇）"),
                     )
                     log.record(
                         "post_skipped",
@@ -442,9 +447,21 @@ class ResearchPipeline:
                         what_happened=exc.what_happened,
                         detail=exc.detail,
                     )
+                    if exc.kind.value in halt_kinds:
+                        self._emit("warn", "采集已停止；此前成功的数据将保留。")
+                        break
                     continue
                 self.store.save_comments(run_id, result.comments)
                 total_comments += len(result.comments)
+                error_kind = getattr(result, "error_kind", "")
+                if result.stopped_reason not in {
+                    "reached_target", "no_more_from_platform", "reached_window_start",
+                    "post_has_no_comments",
+                }:
+                    incomplete = True
+                if error_kind:
+                    self._emit("warn", f"  已保留 {result.count} 条；后续采集未完成："
+                               f"{getattr(result, 'error_message', '')}")
                 self._emit(
                     "ok",
                     f"  {post.mid} 采到 {result.count} 条（{result.backend}，"
@@ -459,6 +476,9 @@ class ResearchPipeline:
                     )
                 for note in (getattr(result, "plan", None) or {}).get("notes", []):
                     self._emit("info", f"    采集口径：{note}")
+                if error_kind in halt_kinds:
+                    self._emit("warn", "采集已停止；此前成功的数据将保留。")
+                    break
             used = limiter.budget.used
 
         if total_comments == 0:
@@ -472,8 +492,9 @@ class ResearchPipeline:
             )
 
         self.store.finish_run(
-            run_id, status="partial" if skipped else "done",
-            note=(f"{len(skipped)} 篇帖子被跳过" if skipped else None),
+            run_id, status="partial" if skipped or incomplete else "done",
+            note=(f"{len(skipped)} 篇帖子被跳过；部分采集未完成"
+                  if skipped or incomplete else None),
         )
         log.record("collect_done", run_id=run_id, comments=total_comments,
                    requests=used, skipped=len(skipped))

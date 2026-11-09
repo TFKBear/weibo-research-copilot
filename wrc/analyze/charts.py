@@ -46,26 +46,19 @@ def _setup(size: int = 10) -> Any:
     import matplotlib.pyplot as plt
     from matplotlib import font_manager
 
-    if _font_ready is None:
-        available = {font.name for font in font_manager.fontManager.ttflist}
-        chosen = [name for name in _CJK_FONTS if name in available]
-        if chosen:
-            plt.rcParams["font.sans-serif"] = chosen + ["DejaVu Sans"]
-            _font_ready = True
-        else:
-            _font_ready = False
-            note("未找到中文字体，图表将使用英文标签（不影响数据）")
-    plt.rcParams["axes.unicode_minus"] = False
-    plt.rcParams["figure.dpi"] = 200
+    # 每次绘图都重新取得候选字体：不能只缓存布尔值，却在后续调用使用
+    # 首次调用的局部变量。Seaborn 每次 set_theme 都会覆盖字体配置。
+    available = {font.name for font in font_manager.fontManager.ttflist}
+    chosen = [name for name in _CJK_FONTS if name in available]
+    if not chosen and _font_ready is not False:
+        note("未找到中文字体，图表将使用英文标签（不影响数据）")
+    _font_ready = bool(chosen)
     # 统一视觉风格：白底 + 淡网格 + 加粗标题。论文插图要的是"一眼能读"，
     # 而不是 matplotlib 的默认灰底小字。seaborn 没装时退回默认样式，不报错。
     try:
         import seaborn as sns
 
         sns.set_theme(style="whitegrid", context="notebook", palette="deep")
-        # set_theme 会重置字体，必须再把中文字体盖回去
-        if _font_ready:
-            plt.rcParams["font.sans-serif"] = chosen + ["DejaVu Sans"]  # type: ignore[possibly-undefined]
         plt.rcParams.update({
             "figure.dpi": 200,
             "savefig.dpi": 200,
@@ -83,6 +76,14 @@ def _setup(size: int = 10) -> Any:
         })
     except Exception:  # noqa: BLE001 - seaborn 不可用就保持 matplotlib 默认
         pass
+    # 放在样式处理之后，且不放在可选依赖的异常吞并范围内。
+    plt.rcParams.update({
+        "font.family": "sans-serif",
+        "font.sans-serif": chosen + ["DejaVu Sans"],
+        "font.size": size,
+        "axes.unicode_minus": False,
+        "figure.dpi": 200,
+    })
     return plt
 
 

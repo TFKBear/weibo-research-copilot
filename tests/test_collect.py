@@ -305,3 +305,132 @@ def test_retry_then_success_on_rate_limit():
     posts = asyncio.run(scenario())
     assert [post.mid for post in posts] == ["m1"]
     assert state["calls"] == 2
+
+
+def test_business_error_on_first_page_tries_fallback():
+    client = make_client(_comment_router(
+        mobile_payload={"ok": 0, "msg": "暂无数据"},
+        web_payload={"ok": 1, "data": [_WEB_COMMENT], "max_id": 0},
+    ))
+    result = asyncio.run(client.collect_comments("m1", expected_total=50))
+    assert result.backend == "web_build_comments"
+    assert result.count == 1
+    assert result.attempts[0][0] == "mobile_hotflow"
+
+
+@pytest.mark.parametrize("failure", [
+    {"ok": 0, "msg": "暂无数据"},
+    {"ok": -100},
+    "invalid json",
+])
+def test_pagination_failure_preserves_successful_pages(failure):
+    def router(request):
+        if request.params.get("max_id", 0):
+            return failure
+        return {"ok": 1, "data": {"data": [_WEB_COMMENT], "max_id": 123}}
+
+    result = asyncio.run(make_client(router).collect_comments("m1", target=500))
+    assert [c.cid for c in result.comments] == ["w1"]
+    assert result.stopped_reason == "pagination_error"
+    assert result.error_kind in {"api", "auth_required", "parse"}
+    assert result.window["complete"] is False
+
+
+def test_time_sort_prefers_sort_capable_backend():
+    client = make_client(_comment_router(
+        mobile_payload={"ok": 1, "data": [_WEB_COMMENT]},
+        web_payload={"ok": 1, "data": [_WEB_COMMENT], "max_id": 0},
+    ))
+    result = asyncio.run(client.collect_comments("m1", sort="time"))
+    assert result.backend == "web_build_comments"
+    assert result.sort_applied
+
+
+def test_auth_failure_does_not_try_other_backends():
+    from wrc.errors import AuthRequired
+    calls = []
+    def router(request):
+        calls.append(request)
+        return {"ok": -100}
+    with pytest.raises(AuthRequired):
+        asyncio.run(make_client(router).collect_comments("m1"))
+    assert len(calls) == 1
+
+
+def test_unknown_total_with_all_backend_errors_is_not_empty_success():
+    with pytest.raises(CommentSourceEmpty):
+        asyncio.run(make_client(lambda _: {"ok": 0, "msg": "暂无数据"})
+                    .collect_comments("m1"))
+
+
+def test_subcomment_failure_preserves_primary_and_previous_replies():
+    calls = 0
+    def router(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            parent = {**_WEB_COMMENT, "total_number": 5}
+            return {"ok": 1, "data": {"data": [parent], "max_id": 0}}
+        if calls == 2:
+            return {"ok": 1, "data": {"data": [{**_WEB_COMMENT, "id": "reply1"}],
+                                     "max_id": 100}}
+        return {"ok": 0, "msg": "暂无数据"}
+    result = asyncio.run(make_client(router).collect_comments(
+        "m1", target=1, include_subcomments=True))
+    assert [c.cid for c in result.comments] == ["w1", "reply1"]
+    assert result.stopped_reason == "subcomments_error"
+
+
+def test_duplicate_ids_within_page_do_not_fill_target():
+    def router(request):
+        items = ([_WEB_COMMENT, _WEB_COMMENT] if not request.params.get("max_id")
+                 else [{**_WEB_COMMENT, "id": "w2"}])
+        return {"ok": 1, "data": {"data": items,
+                                 "max_id": 0 if request.params.get("max_id") else 123}}
+    result = asyncio.run(make_client(router).collect_comments("m1", target=2))
+    assert [c.cid for c in result.comments] == ["w1", "w2"]
+    assert result.pages_fetched == 2
+
+
+def test_window_statistics_describe_retained_comments_only():
+    items = [{**_WEB_COMMENT, "id": str(i), "created_at": f"2025-05-{i:02d} 10:00:00"}
+             for i in range(1, 4)]
+    result = asyncio.run(make_client(lambda _: {"ok": 1, "data": items})
+                         .collect_comments("m1", target=2))
+    assert result.count == result.window["in_window"] == 2
+    assert result.window["covered_to"].startswith("2025-05-02")
+
+
+def test_user_stop_preserves_first_page_without_fetching_next():
+    calls = []
+    def router(request):
+        calls.append(request)
+        return {"ok": 1, "data": {"data": [_WEB_COMMENT], "max_id": 123}}
+    result = asyncio.run(make_client(router).collect_comments(
+        "m1", target=500, should_stop=lambda: bool(calls)))
+    assert len(calls) == result.count == 1
+    assert result.stopped_reason == "user_stopped"
+
+
+def test_subcomment_budget_exhaustion_is_partial():
+    parent = {**_WEB_COMMENT, "total_number": 5}
+    result = asyncio.run(make_client(lambda _: {"ok": 1, "data": [parent]}, budget=1)
+                         .collect_comments("m1", target=1, include_subcomments=True))
+    assert result.count == 1
+    assert result.error_kind == "budget"
+    assert result.stopped_reason == "subcomments_error"
+
+
+def test_subcomment_repeated_cursor_stops_even_with_new_ids():
+    calls = []
+    def router(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return {"ok": 1, "data": [{**_WEB_COMMENT, "total_number": 100}]}
+        return {"ok": 1, "data": [{**_WEB_COMMENT, "id": f"r{len(calls)}"}],
+                "max_id": 123}
+    result = asyncio.run(make_client(router).collect_comments(
+        "m1", target=1, include_subcomments=True, subcomment_target=100))
+    assert len(calls) == 3
+    assert result.count == 3
+    assert result.stopped_reason == "subcomments_cursor_stalled"

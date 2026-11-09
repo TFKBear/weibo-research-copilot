@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
 
-from ..errors import CommentSourceEmpty, ConfigProblem, EmptyResult, WrcError
+from ..errors import CommentSourceEmpty, ConfigProblem, EmptyResult, ErrorKind, WrcError
 from ..fetching import Fetcher
 from .comment_backends import AUTO_BACKENDS, get_backend
 from .endpoints import (
@@ -67,6 +67,9 @@ class CommentFetchResult:
 
     attempts: list[tuple[str, str]] = field(default_factory=list)
     """各后端的尝试结果，用于诊断「为什么最终用了/没用某个后端」。"""
+
+    error_kind: str = ""
+    error_message: str = ""
 
     @property
     def count(self) -> int:
@@ -218,6 +221,7 @@ class WeiboClient:
         since: datetime | None = None,
         until: datetime | None = None,
         max_scan_pages: int | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> CommentFetchResult:
         """采集一篇帖子的评论。
 
@@ -254,6 +258,8 @@ class WeiboClient:
             )
 
         candidates = AUTO_BACKENDS if backend == "auto" else (get_backend(backend),)
+        if backend == "auto" and sort == "time":
+            candidates = tuple(sorted(candidates, key=lambda b: not b.supports_sort))
         attempts: list[tuple[str, str]] = []
         chosen = None
         first_page = None
@@ -262,6 +268,7 @@ class WeiboClient:
             request = candidate.request(post_mid, max_id=0, max_id_type=0, sort=sort)
             try:
                 payload = await self.get_json(request)
+                page = parse_comments_page(payload, post_mid=post_mid)
             except WrcError as exc:
                 attempts.append((candidate.key, f"{exc.kind.value}：{exc.what_happened}"))
                 self._record(
@@ -270,11 +277,10 @@ class WeiboClient:
                     backend=candidate.key,
                     kind=exc.kind.value,
                 )
-                if backend != "auto":
+                if backend != "auto" or exc.kind not in {ErrorKind.API, ErrorKind.PARSE}:
                     raise
                 continue
 
-            page = parse_comments_page(payload, post_mid=post_mid)
             if page.comments:
                 chosen, first_page = candidate, page
                 self._record(
@@ -300,7 +306,9 @@ class WeiboClient:
                 break
 
         if chosen is None or first_page is None or not first_page.comments:
-            if expected_total is not None and expected_total > 0:
+            if (expected_total is not None and expected_total > 0) or any(
+                not outcome.startswith("空数据") for _, outcome in attempts
+            ):
                 raise CommentSourceEmpty(
                     post_mid=post_mid,
                     expected_total=expected_total,
@@ -351,10 +359,11 @@ class WeiboClient:
         )
 
         seen_cids: set[str] = set()
-        seen_cursors: set[int] = set()
+        seen_cursors: set[tuple[int, int]] = set()
         max_pages = plan.page_cap
         page = first_page
         page_index = 0
+        current_cursor = 0
 
         while True:
             page_index += 1
@@ -362,12 +371,17 @@ class WeiboClient:
             if page.total_number is not None:
                 result.total_number = page.total_number
 
-            fresh = [c for c in page.comments if c.cid not in seen_cids]
-            for comment in fresh:
+            fresh = []
+            for comment in page.comments:
+                if comment.cid in seen_cids:
+                    continue
                 seen_cids.add(comment.cid)
+                fresh.append(comment)
             for comment in fresh:
                 accepted = coverage.window.accepts(comment)
                 if accepted:
+                    if len(result.comments) >= target:
+                        continue
                     result.comments.append(comment)
                 coverage.observe(comment, in_window=accepted)
 
@@ -381,11 +395,15 @@ class WeiboClient:
                 accumulated=len(result.comments),
                 out_of_window=coverage.out_of_window,
                 oldest=(page_oldest(fresh).isoformat() if page_oldest(fresh) else None),
-                cursor=0 if page_index == 1 else page_index,
+                cursor=current_cursor,
             )
 
             if len(result.comments) >= target:
                 result.stopped_reason = "reached_target"
+                break
+
+            if should_stop is not None and should_stop():
+                result.stopped_reason = "user_stopped"
                 break
 
             # 只有"时间单调递减"的流才能这样停：本页最早的一条已早于窗口起点，
@@ -405,7 +423,9 @@ class WeiboClient:
             if cursor <= 0:
                 result.stopped_reason = "empty_cursor"
                 break
-            if cursor in seen_cursors:
+            max_id_type = int(page.next_max_id_type or 0)
+            cursor_key = (cursor, max_id_type)
+            if cursor_key in seen_cursors:
                 # 接口退化时会重复返回同一个 cursor，继续翻只会空转并增加风控风险
                 result.stopped_reason = "cursor_stalled"
                 self._record("cursor_stalled", post_mid=post_mid, cursor=cursor)
@@ -415,14 +435,24 @@ class WeiboClient:
                     "budget_near_limit" if plan.clamped_by_budget else "page_cap"
                 )
                 break
-            seen_cursors.add(cursor)
+            seen_cursors.add(cursor_key)
 
-            max_id_type = int(page.next_max_id_type or 0)
+            current_cursor = cursor
             request = chosen.request(
                 post_mid, max_id=cursor, max_id_type=max_id_type, sort=sort
             )
-            payload = await self.get_json(request)
-            page = parse_comments_page(payload, post_mid=post_mid)
+            try:
+                payload = await self.get_json(request)
+                page = parse_comments_page(payload, post_mid=post_mid)
+            except WrcError as exc:
+                # 后续页失败不能丢弃此前成功页，也不能宣称已覆盖完整评论区。
+                result.stopped_reason = "pagination_error"
+                result.error_kind = exc.kind.value
+                result.error_message = exc.what_happened
+                self._record("comments_pagination_failed", post_mid=post_mid,
+                             backend=chosen.key, cursor=cursor, kind=exc.kind.value,
+                             retained=len(result.comments), detail=exc.detail)
+                break
 
             if not page.comments and len(result.comments) < target:
                 # 翻页中途突然空页：不是"翻完了"，而是这一页没给数据。
@@ -446,9 +476,15 @@ class WeiboClient:
         result.window = coverage.to_dict()
 
         if include_subcomments:
-            await self._attach_subcomments(
-                result, subcomment_target=subcomment_target
-            )
+            if not result.error_kind and result.stopped_reason != "user_stopped":
+                try:
+                    await self._attach_subcomments(
+                        result, subcomment_target=subcomment_target, should_stop=should_stop
+                    )
+                except WrcError as exc:
+                    result.stopped_reason = "subcomments_error"
+                    result.error_kind = exc.kind.value
+                    result.error_message = exc.what_happened
 
         self._record(
             "comments_done",
@@ -456,6 +492,8 @@ class WeiboClient:
             target=target,
             collected=len(result.comments),
             stopped_reason=result.stopped_reason,
+            error_kind=result.error_kind,
+            error_message=result.error_message,
             backend=result.backend,
             sort=sort,
             sort_applied=result.sort_applied,
@@ -469,7 +507,8 @@ class WeiboClient:
         return result
 
     async def _attach_subcomments(
-        self, result: CommentFetchResult, *, subcomment_target: int
+        self, result: CommentFetchResult, *, subcomment_target: int,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         """为有跟评的一级评论补抓二级评论。
 
@@ -488,10 +527,21 @@ class WeiboClient:
             cursor, cursor_type = 0, 0
             got = 0
             seen: set[str] = set()
+            cursors: set[tuple[int, int]] = set()
             while got < want:
+                if should_stop is not None and should_stop():
+                    result.stopped_reason = "user_stopped"
+                    return
                 if self._limiter.budget.remaining <= 0:
                     self._record("subcomments_budget_stop", parent_cid=parent.cid)
+                    result.stopped_reason = "subcomments_error"
+                    result.error_kind = "budget"
+                    result.error_message = "二级评论采集达到请求上限，已保留此前数据。"
                     return
+                if (cursor, cursor_type) in cursors:
+                    result.stopped_reason = "subcomments_cursor_stalled"
+                    return
+                cursors.add((cursor, cursor_type))
                 request = subcomments_request(
                     parent.cid, max_id=cursor, max_id_type=cursor_type
                 )
@@ -502,12 +552,17 @@ class WeiboClient:
                     level=CommentLevel.SECONDARY,
                     parent_cid=parent.cid,
                 )
-                fresh = [c for c in page.comments if c.cid not in seen]
+                fresh = []
+                for comment in page.comments:
+                    if comment.cid not in seen:
+                        seen.add(comment.cid)
+                        fresh.append(comment)
                 if not fresh:
+                    if page.has_more:
+                        result.stopped_reason = "subcomments_cursor_stalled"
                     break
-                for comment in fresh:
-                    seen.add(comment.cid)
                 collected.extend(fresh[: want - got])
+                result.comments.extend(fresh[: want - got])
                 got += len(fresh[: want - got])
                 if not page.has_more or not page.next_max_id:
                     break
@@ -515,7 +570,6 @@ class WeiboClient:
                 if page.next_max_id_type is not None:
                     cursor_type = int(page.next_max_id_type)
 
-        result.comments.extend(collected)
         self._record(
             "subcomments_done",
             parents=len(parents),

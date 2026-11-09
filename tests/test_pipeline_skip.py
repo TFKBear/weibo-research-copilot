@@ -75,6 +75,8 @@ class _FakeClient:
         outcome = self._behaviour.get(post_mid)
         if isinstance(outcome, Exception):
             raise outcome
+        if isinstance(outcome, SimpleNamespace):
+            return outcome
         count = outcome if isinstance(outcome, int) else 2
         comments = [_comment(f"{post_mid}-{index}") for index in range(count)]
         return SimpleNamespace(
@@ -179,3 +181,23 @@ def test_clean_run_keeps_status_done(store, tmp_path):
     (run_id, total, _used), _client = _run(store, tmp_path, {"m1": 4}, posts)
     assert total == 4
     assert store.get_run(run_id)["status"] == "done"
+
+
+@pytest.mark.parametrize("error_kind, expected_calls", [
+    ("api", ["m1", "m2"]), ("auth_required", ["m1"]),
+    ("risk_blocked", ["m1"]), ("budget", ["m1"]),
+])
+def test_partial_result_is_persisted_and_global_errors_stop(
+    store, tmp_path, error_kind, expected_calls,
+):
+    partial = SimpleNamespace(
+        comments=[_comment("saved")], count=1, backend="mobile_hotflow",
+        stopped_reason="pagination_error", error_kind=error_kind,
+        error_message="后续页失败",
+    )
+    (run_id, total, _), client = _run(
+        store, tmp_path, {"m1": partial, "m2": 2}, [_post("m1"), _post("m2")])
+    assert client.calls == expected_calls
+    assert total == (3 if error_kind == "api" else 1)
+    assert store.get_run(run_id)["status"] == "partial"
+    assert any(c["cid"] == "saved" for c in store.load_comments(run_id))

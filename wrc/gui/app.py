@@ -1144,7 +1144,7 @@ class App(tk.Tk):
                 self.do_cluster_var.get(),
                 self.do_stance_var.get(),
             ))
-            if wants_analysis:
+            if wants_analysis and not self.stop_event.is_set():
                 self._log("info", "=" * 40)
                 self._log("info", "采集与导出完成，接着自动分析并生成报告 …")
                 # 采集已经落盘，分析失败不会毁掉数据；这里只把控制权交给分析流程
@@ -1476,7 +1476,8 @@ class App(tk.Tk):
 
     def _on_stop(self) -> None:
         self.stop_event.set()
-        self._log("warn", "已请求停止：当前这篇帖子采集完就会停下，已采数据会保留。")
+        self._log("warn", "已请求停止：采集将在当前请求完成后停止，已采数据会保留；"
+                  "后续自动分析已取消。若分析已启动，需等待当前分析任务结束。")
 
     # ------------------------------------------------------------------ #
     # 跨话题对比
